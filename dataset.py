@@ -29,6 +29,8 @@ class StatefulStreamingDataset(IterableDataset):
     """
     def __init__(self, sources, initial_weights, chunk_size=4096):
         self.sources = sources
+        # Use a multiprocessing Array for weights to ensure they are shared
+        # across all data loader worker processes.        
         self.weights = mp.Array('d', initial_weights)
         self.chunk_size = chunk_size
         self.data_streams = None
@@ -38,39 +40,71 @@ class StatefulStreamingDataset(IterableDataset):
         return np.array(self.weights[:])
 
     def update_weights(self, new_weights: list[float]):
-        """Updates the shared weights from the main process."""
+        """
+        Updates the shared weights from the main process. 
+        This method is called from the main process by a custom callback.
+        """
         with self.weights.get_lock():
             for i in range(len(new_weights)):
                 self.weights[i] = new_weights[i]
+                
+    def process_sample(self, raw_sample: dict) -> dict:
+        """
+        Decodes a single sample from raw bytes to a tensor dictionary based on
+        the exact specifications from the data creation script.
+        """
+        # Use np.uint16 as the data type, which is confirmed by the source script.
+        token_ids_np = np.frombuffer(raw_sample['tokens'], dtype=np.uint16)
+    
+        # Convert the NumPy array to a PyTorch tensor.
+        # It's good practice to .copy() to avoid potential memory ownership issues.
+        token_ids_tensor = torch.from_numpy(token_ids_np.copy())
+        
+        # The Hugging Face model and collator expect a dictionary containing
+        # `input_ids` and `attention_mask`.
+        final_sample = {
+            'input_ids': token_ids_tensor,
+            # The attention mask is a tensor of all 1s since the data is
+            # pre-chunked to a fixed length with no padding.
+            'attention_mask': torch.ones_like(token_ids_tensor),
+            'set':raw_sample['set']
+        }
+        return final_sample
 
     def __iter__(self):
         """The core streaming logic for each worker, using chunked sampling."""
+        # Initialize streams if they haven't been, relevant for num_workers=0
         if self.data_streams is None:
             self.data_streams = [iter(source) for source in self.sources]
 
         while True:
+            # 1. Get weights and probabilities ONCE per chunk.
             current_weights = self._get_weights()
             probabilities = current_weights / np.sum(current_weights)
             
+            # 2. Generate a large chunk of source indices at once.
+            # This is vastly more efficient than calling it in a loop.
             source_indices = np.random.choice(
                 len(self.sources), 
                 size=self.chunk_size, 
                 p=probabilities
             ) # generate a chunk of indices from 0 to len(sources)-1
-            
+
+            # 3. Iterate through the pre-sampled chunk and yield items.
             for source_idx in source_indices:
                 try:
-                    yield next(self.data_streams[source_idx])
+                    yield self.process_sample(next(self.data_streams[source_idx]))
                 except StopIteration:
                     # A source was exhausted, restart it for continuous training
+                    print(f"Worker {get_worker_info().id if get_worker_info() else 0}: Restarting stream {source_idx}.")
                     self.data_streams[source_idx] = iter(self.sources[source_idx])
-                    yield next(self.data_streams[source_idx])
+                    yield self.process_sample(next(self.data_streams[source_idx]))
 
 
 # ==============================================================================
 # 2. MAIN SCRIPT TO INITIALIZE AND COMBINE EVERYTHING
 # ==============================================================================
-BATCH_SIZE = 128
+BATCH_SIZE = 2
 if __name__ == "__main__":
     # Use spawn for multiprocessing to be safe across platforms
     mp.set_start_method("spawn", force=True)
@@ -124,12 +158,12 @@ if __name__ == "__main__":
         # `batch` is now a dictionary where each value is a tensor of `batch_size`
         print(f"Step {i}:")
         print(f"  Batch keys: {batch.keys()}")
-        print(f"  Tokens tensor length: {[len(a) for a in batch['tokens']]}")
-        
+        print(f"  value: {batch['input_ids']}")
+        print(f"  Attention mask: {batch['attention_mask']}")
         # You can access the 'set' to see which domain the data came from
         # Note: In a batch, you might get samples from multiple domains
         unique_sets, counts = np.unique(batch['set'], return_counts=True)
-        print(f"  Domain counts in batch: {dict(zip(unique_sets, counts))}")
+        print(f"  Domain counts in batch: {dict(zip(map(str, unique_sets), map(int, counts)))}")
 
         if i >= 3:
             print("\nDemonstration complete.")
