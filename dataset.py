@@ -20,7 +20,7 @@ class StatefulShardedDataset(IterableDataset):
         self,
         domain_dirs: Dict[str, str],
         initial_weights: Optional[List[float]] = None,
-        chunk_size: int = 8192,
+        chunk_size: int = 1,
     ):
         super().__init__()
         # 1. Store configurations - these are simple and safe to pickle
@@ -67,7 +67,10 @@ class StatefulShardedDataset(IterableDataset):
                     data = np.load(shard_files[i])
                     np.random.shuffle(data)
                     for sample in data:
-                        yield {"input_ids": torch.from_numpy(sample), "set": name}
+                        yield {
+                            "input_ids": torch.from_numpy(sample).long(), 
+                            # "set": name,
+                        }
 
         domain_gens = [make_domain_gen(name, shards) for name, shards in zip(self.domain_names, self.domain_shards)]
 
