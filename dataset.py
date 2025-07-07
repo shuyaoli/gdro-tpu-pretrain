@@ -51,7 +51,6 @@ class StatefulShardedDataset(IterableDataset):
             self.weights[:] = torch.tensor(new_weights, dtype=torch.double)
 
     def __iter__(self):
-
         # pick a seed: DataLoader has already set torch.initial_seed()
         seed = torch.initial_seed() % (2**32)
         np.random.seed(seed)
@@ -80,6 +79,56 @@ class StatefulShardedDataset(IterableDataset):
                                       generator=rng).tolist()
             for d in picks:
                 yield next(domain_gens[d])
+
+# ==============================================================================
+
+
+class EvaluationShardedDataset(IterableDataset):
+    """
+    IterableDataset for evaluation: 
+    - visits each .npy shard exactly once, in a reproducible, shuffled order
+    - correctly splits shards across DataLoader workers
+    - uses only PyTorch RNG for determinism
+    """
+    def __init__(self, data_dir: str):
+        super().__init__()
+        self.data_dir     = data_dir
+        # Gather and sort all shards
+        self.shard_files = sorted(glob(os.path.join(self.data_dir, '*.npy')))
+        if not self.shard_files:
+            raise FileNotFoundError(f"No .npy shards in {self.data_dir!r}")
+
+    def __iter__(self):
+        # 1) Deterministically shuffle shard *indices* once per epoch
+        seed = torch.initial_seed() % (2**32)
+        shuf_gen = torch.Generator().manual_seed(seed)
+        all_idxs = torch.randperm(len(self.shard_files), generator=shuf_gen).tolist()
+
+        # 2) Split among workers
+        worker = get_worker_info()
+        if worker is None:
+            my_idxs = all_idxs
+        else:
+            wid, nw = worker.id, worker.num_workers
+            my_idxs = all_idxs[wid :: nw]
+
+        # 3) Iterate assigned shards
+        for shard_idx in my_idxs:
+            path = self.shard_files[shard_idx]
+
+            # load and make a tensor
+            data = torch.from_numpy(np.load(path)).long() 
+
+            # 4) Shuffle *within* this shard in a reproducible way
+            #    seed = global_seed + shard_idx ensures unique but deterministic per-shard order
+            shard_seed = (seed + shard_idx) % (2**32)
+            shard_gen  = torch.Generator().manual_seed(shard_seed)
+            perm       = torch.randperm(data.size(0), generator=shard_gen)
+            data       = data[perm]
+
+            # 5) Yield sample by sample
+            for sample in data:
+                yield {'input_ids': sample}
 
 if __name__ == "__main__":
     # 1) Top-level reproducible seed
@@ -132,3 +181,26 @@ if __name__ == "__main__":
         if i >= 5:
             print("\nDemo complete.")
             break
+
+    eval_dir = "/home/shuyaoli/llm_data/converted_dataset/eval_merge"
+
+    # 3) Instantiate dataset
+    ds = EvaluationShardedDataset(data_dir=eval_dir)
+
+    # 4) Create DataLoader (with worker‐controlled seeding via generator)
+    loader = DataLoader(
+        ds,
+        batch_size=4,         # how many samples per batch
+        num_workers=2,        # spawn 2 workers
+        generator=g,          # ensures each worker has a reproducible torch.initial_seed()
+        persistent_workers=True,
+    )
+
+    # 5) Iterate a few batches
+    print("Starting evaluation iteration:")
+    for i, batch in enumerate(loader):
+        print(f"Batch {i}:")
+        print("  input_ids.shape =", batch['input_ids'].shape)
+        if i >= 3:
+            print("\nDemo complete.")
+            break        
