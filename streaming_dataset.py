@@ -25,7 +25,7 @@ class StatefulShardedDataset(IterableDataset):
         super().__init__()
         # 1. Store configurations - these are simple and safe to pickle
         self.domain_names  = list(domain_dirs)
-        self.domain_shards : list[list[str]] = [
+        self.domain_shards : List[List[str]] = [
             glob(os.path.join(path, "*.npy")) for path in domain_dirs.values()
         ]
         self.chunk_size = chunk_size
@@ -79,9 +79,11 @@ class StatefulShardedDataset(IterableDataset):
             picks = torch.multinomial(probs,
                                       self.chunk_size,
                                       replacement=True,
-                                      generator=rng).tolist()
+                                      generator=rng).tolist()                       
             for d in picks:
+                print(f"[Dataset DEBUG] yielding one sample from domain {d}")  # <<< 
                 yield next(domain_gens[d])
+                print(f"[DATASET DEBUG] Item yielded successfully")
 
 # ==============================================================================
 

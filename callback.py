@@ -4,10 +4,12 @@ from transformers.trainer_callback import (
     TrainerControl,
 )
 from transformers.training_args import TrainingArguments
-from dataset import StatefulShardedDataset  # Assuming this is your custom dataset
+from streaming_dataset import StatefulShardedDataset  # Assuming this is your custom dataset
 import torch
 import torch_xla.core.xla_model as xm
 from typing import Callable
+import time
+
 
 class DynamicSamplingOnEvaluationCallback(TrainerCallback):
     """
@@ -87,3 +89,15 @@ class DynamicSamplingCallback(TrainerCallback): # Not used
                 
                 # 3. Update the dataset's weights directly
                 self.dataset.update_weights(new_weights)
+
+class StepTimingCallback(TrainerCallback):
+    def on_step_begin(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        # xm.mark_step()
+        self._step_start = time.time()
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):        # xm.mark_step()
+        dur = time.time() - self._step_start
+        print(f"[StepTimingCallback] Step {state.global_step} wall-clock time: {dur:.2f}s")
+        
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        print(f"[StepTimingCallback] Trainer logged at step {state.global_step}: {logs}")
